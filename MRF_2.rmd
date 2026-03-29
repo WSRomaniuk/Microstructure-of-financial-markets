@@ -1,0 +1,579 @@
+---
+title: "Mikrostruktura rynków finansowych"
+author: |
+  Sebastian Szklarski, Wiktor Suchoński-Romaniuk,  
+  Wiktoria Wróbel, Maciej Więcek
+output:
+  html_document:
+    math_method:
+      engine: mathjax
+    theme: bootstrap
+    df_print: paged
+    toc: true
+    toc_float:
+      smooth_scroll: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+knitr::opts_chunk$set(fig.align = "center")
+knitr::opts_chunk$set(dpi = 250)
+
+library(dplyr)
+library(lubridate)
+library(psych)
+library(magrittr)
+library(kableExtra)
+library(ggplot2)
+library(hms)
+library(ACDm)
+library(goftest)
+```
+
+## Transakcyjne czasy trwania
+
+### Porównanie czasów trwania
+
+W analizie wykorzystano dane transakcyjne typu tick-by-tick dla spółek A i E, ograniczone do notowań ciągłych. Na ich podstawie wyznaczono transakcyjne czasy trwania, przy czym dane zostały zagregowane do częstotliwości sekundowej w celu uzyskania prostego procesu punktowego.
+
+Na poniższych wykresach przedstawione transakcyjne czasy trwania spółek w wybranym dniu.
+
+```{r}
+daneA <- read.csv("spolkaA.csv", sep = ";")
+daneA <- daneA %>%
+  mutate(data = ymd_hms(paste0(daty, sprintf("%06d", godz)))) %>%
+  filter(data >= floor_date(data, "day") + hours(9),
+         data <= floor_date(data, "day") + hours(16) + minutes(50)) %>%
+  dplyr::select(data, cena, vol)
+
+daneE <- read.csv("spolkaE.csv", sep = ";")
+daneE <- daneE %>%
+  mutate(data = ymd_hms(paste0(daty, sprintf("%06d", godz)))) %>%
+  filter(data >= floor_date(data, "day") + hours(9),
+         data <= floor_date(data, "day") + hours(16) + minutes(50)) %>%
+  dplyr::select(data, cena, vol)
+
+daneA_pp <- daneA %>%
+  group_by(data) %>%
+  summarise(cena = sum(cena * vol) / sum(vol), vol = sum(vol), .groups = "drop")
+
+daneE_pp <- daneE %>%
+  group_by(data) %>%
+  summarise(cena = sum(cena * vol) / sum(vol), vol = sum(vol), .groups = "drop")
+
+daneA_pp <- daneA_pp %>%
+  group_by(grp = as.Date(data)) %>%
+  mutate(trade_duration = data - lag(data)) %>%
+  ungroup() %>% select(-grp)
+
+daneE_pp <- daneE_pp %>%
+  group_by(grp = as.Date(data)) %>%
+  mutate(trade_duration = data - lag(data)) %>%
+  ungroup() %>% select(-grp)
+```
+
+```{r fig.height=2, fig.width=5}
+ggplot(daneA_pp %>% filter(as.Date(data) == as.Date("2018-01-04")),
+       aes(x = data, y = trade_duration)) +
+  geom_point(alpha = 0.7) +
+  theme_linedraw(base_size = 7) +
+  scale_x_datetime(date_breaks = "1 hour", date_labels = "%H:%M") +
+  labs(title = "Transakcyjne czasy trwania - spółka A (04.01.2018)",
+       y = "czas trwania [s]") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_blank())
+```
+
+```{r fig.height=2, fig.width=5}
+ggplot(daneE_pp %>% filter(as.Date(data) == as.Date("2018-01-04")),
+       aes(x = data, y = trade_duration)) +
+  geom_point(alpha = 0.7) +
+  theme_linedraw(base_size = 7) +
+  scale_x_datetime(date_breaks = "1 hour", date_labels = "%H:%M") +
+  labs(title = "Transakcyjne czasy trwania - spółka E (04.01.2018)",
+       y = "czas trwania [s]") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_blank())
+```
+
+Zaobserwowane transakcyjne czasy trwania wahają się od kilku do kilkuset sekund, przy czym dla spółki A osiągają wartości przekraczające 600 sekund, natomiast dla spółki E maksymalnie około 500 sekund. W obu przypadkach dłuższe czasy trwania pojawiają się głównie w środkowej części sesji. Jednocześnie widoczna jest wysoka koncentracja bardzo krótkich czasów trwania, szczególnie dla spółki E, co może wskazywać na wyższą intensywność handlu w analizowanym dniu.
+
+```{r}
+rbind(describe(as.numeric(daneA_pp$trade_duration)),
+      describe(as.numeric(daneE_pp$trade_duration))) %>%
+  dplyr::select(mean, sd, median, min, max, skew, kurtosis) %>%
+  mutate(kurtosis = kurtosis + 3) %>%
+  set_rownames(c("Spółka A", "Spółka E")) %>%
+  kable(col.names = c("Średnia", "Odch. std.", "Mediana", 
+                      "Min", "Max", "Skośność", "Kurtoza"),
+        caption = "Statystyki opisowe transakcyjnych czasów trwania", digits = 3) %>%
+  kable_styling(full_width = TRUE)
+```
+
+Statystyki opisowe wskazują na silną prawostronną asymetrię rozkładów transakcyjnych czasów trwania dla obu spółek. Mediany są istotnie niższe od średnich, co oznacza, że większość transakcji następuje w krótkich odstępach czasu, przy występowaniu pojedynczych, długich przerwy w handlu. Zróżnicowanie czasów trwania jest wysokie, przy czym w przypadku spółki A obserwuje się większą skłonność do występowania długich przerw niż dla spółki E. Potwierdzają to dodatnie wartości skośności oraz bardzo wysoka kurtoza, wskazujące na częstsze występowanie obserwacji skrajnych.
+
+### Śróddzienna sezonowość
+
+Na poniższych wykresach przedstawiono przekrojowe średnie transakcyjnych czasów trwania w 5-minutowych przedziałach czasowych, zarówno przed, jak i po usunięciu śróddziennej sezonowości. Korekty dokonano z wykorzystaniem Elastycznej Formy Fouriera rzędu trzeciego, z uwzględnieniem podziału na dni tygodnia sesji.
+
+```{r}
+daneA_pp_5m <- daneA_pp %>%
+  mutate(data = ceiling_date(data, "5 minutes", change_on_boundary = FALSE)) %>%
+  mutate(data = if_else(data == floor_date(data, "day") + hours(9), 
+                        data + minutes(5), data))
+
+daneE_pp_5m <- daneE_pp %>%
+  mutate(data = ceiling_date(data, "5 minutes", change_on_boundary = FALSE)) %>%
+  mutate(data = if_else(data == floor_date(data, "day") + hours(9), 
+                        data + minutes(5), data))
+
+daneA_sesja <- daneA_pp_5m %>%
+  group_by(godz = as_hms(data)) %>%
+  summarise(trade_duration = mean(trade_duration, na.rm = TRUE))
+
+daneE_sesja <- daneE_pp_5m %>%
+  group_by(godz = as_hms(data)) %>%
+  summarise(trade_duration = mean(trade_duration, na.rm = TRUE))
+```
+
+```{r fig.height=3, fig.width=5}
+ggplot() +
+  geom_line(data = daneA_sesja, 
+            aes(godz, trade_duration, linetype = "spółka A"), linewidth = 0.3) +
+  geom_line(data = daneE_sesja, 
+            aes(godz, trade_duration, linetype = "spółka E"), linewidth = 0.3) +
+  theme_linedraw(base_size = 7) +
+  scale_x_time(date_breaks = "1 hour", date_labels = "%H:%M") +
+  labs(title = "Przekrojowe średnie transakcyjnych czasów trwania (przed modyfikacją)",
+       y = "czas trwania [s]") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_blank(), legend.title = element_blank(),
+        legend.position = "bottom")
+```
+
+Przekrojowe średnie transakcyjnych czasów trwania dla obu spółek wykazują wyraźny śróddzienny wzorzec o kształcie zbliżonym do odwróconej litery "U". Na początku i na końcu sesji czasy trwania są krótsze, co wskazuje na wyższą aktywność transakcyjną i większą płynność rynku. W środkowej części sesji obserwowany jest wzrost średnich czasów trwania, odzwierciedlający obniżoną intensywność handlu. Zbliżony przebieg dla spółek A i E wskazuje na podobne kształtowanie się dziennego profilu czasów trwania obu spółek.
+
+```{r fig.show='hide'}
+daneA_diurAdj <- diurnalAdj(
+  data.frame(time = daneA_pp_5m$data, 
+             durations = daneA_pp_5m$trade_duration) %>% na.omit(),
+  aggregation = "weekdays", method = "FFF", Q = 3)
+
+daneA_diurAdj <- daneA_diurAdj %>%
+  mutate(seasonal = durations / adjDur,
+         weekday = wday(time, week_start = 1))
+```
+
+```{r fig.height=3, fig.width=5}
+daneA_diurAdj %>%
+  mutate(time = as_hms(time)) %>%
+  group_by(weekday, time) %>%
+  summarise(seasonal = mean(seasonal), .groups = "drop") %>%
+  ggplot(aes(x = time, y = seasonal, 
+             color = as.factor(weekday),
+             linetype = as.factor(weekday))) +
+  geom_line(linewidth = 0.3) +
+  theme_linedraw(base_size = 7) +
+  scale_color_manual(values = c("1" = "grey10", "2" = "grey10", 
+                                "3" = "steelblue", "4" = "steelblue", 
+                                "5" = "grey70"),
+                     labels = c("poniedziałek", "wtorek", "środa", 
+                                "czwartek", "piątek"), 
+                     name = "weekday") +
+  scale_linetype_manual(values = c("1" = "solid", "2" = "dashed", 
+                                   "3" = "solid", "4" = "dashed", 
+                                   "5" = "solid"), 
+                        labels = c("poniedziałek", "wtorek", "środa", 
+                                   "czwartek", "piątek"), 
+                        name = "weekday") +
+  scale_x_time(date_breaks = "1 hour", date_labels = "%H:%M") +
+  labs(title = "Przeciętna wartość estymatora sezonowej składowej\ntransakcyjnego czasu trwania - spółka A",
+       y = "średnia składowa estymatora") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_blank(), legend.title = element_blank(),
+        legend.position = "bottom")
+```
+
+Profile przeciętnych wartości estymatora sezonowej składowej transakcyjnych czasów trwania dla spółki A mają zbliżone kształty we wszystkich dniach tygodnia. Dla każdego dnia obserwuje się niższe wartości estymatora na początku oraz pod koniec sesji oraz wyższe wartości w jej środkowej części. Różnice pomiędzy dniami tygodnia mają głównie charakter poziomu wartości. Poniedziałek cechuje się relatywnie wyższymi wartościami estymatora w trakcie całej sesji, natomiast piątek - niższymi, szczególnie na otwarciu i zamknięciu giełdy.
+
+```{r fig.show='hide'}
+daneE_diurAdj <- diurnalAdj(
+  data.frame(time = daneE_pp_5m$data, 
+             durations = daneE_pp_5m$trade_duration) %>% na.omit(),
+  aggregation = "weekdays", method = "FFF", Q = 3)
+
+daneE_diurAdj <- daneE_diurAdj %>%
+  mutate(seasonal = durations / adjDur,
+         weekday = wday(time, week_start = 1))
+```
+
+```{r fig.height=3, fig.width=5}
+daneE_diurAdj %>%
+  mutate(time = as_hms(time)) %>%
+  group_by(weekday, time) %>%
+  summarise(seasonal = mean(seasonal), .groups = "drop") %>%
+  ggplot(aes(x = time, y = seasonal, 
+             color = as.factor(weekday),
+             linetype = as.factor(weekday))) +
+  geom_line(linewidth = 0.3) +
+  theme_linedraw(base_size = 7) +
+  scale_color_manual(values = c("1" = "grey10", "2" = "grey10", 
+                                "3" = "steelblue", "4" = "steelblue", 
+                                "5" = "grey70"),
+                     labels = c("poniedziałek", "wtorek", "środa", 
+                                "czwartek", "piątek"), 
+                     name = "weekday") +
+  scale_linetype_manual(values = c("1" = "solid", "2" = "dashed", 
+                                   "3" = "solid", "4" = "dashed", 
+                                   "5" = "solid"), 
+                        labels = c("poniedziałek", "wtorek", "środa", 
+                                   "czwartek", "piątek"), 
+                        name = "weekday") +
+  scale_x_time(date_breaks = "1 hour", date_labels = "%H:%M") +
+  labs(title = "Przeciętna wartość estymatora sezonowej składowej\ntransakcyjnego czasu trwania - spółka E",
+       y = "średnia składowa estymatora") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_blank(), legend.title = element_blank(),
+        legend.position = "bottom")
+```
+
+Profile przeciętnych wartości estymatora sezonowej składowej transakcyjnych czasów trwania dla spółki E są zbliżone we wszystkich dniach tygodnia. We wszystkich przypadkach obserwuje się niższe wartości estymatora na początku i pod koniec sesji oraz wyższe wartości w jej środkowej części. Na tle pozostałych dni piątek wyróżnia się wyższym poziomem estymatora w godzinach okołopołudniowych, wtorek cechuje się niższymi wartościami na otwarciu sesji, natomiast w poniedziałek maksimum występuje później w porównaniu do pozostałych dni.
+
+W obu spółkach widoczny jest podobny śróddzienny kształt przebiegu estymatora sezonowej składowej transakcyjnych czasów trwania, z niższymi wartościami na otwarciu i zamknięciu sesji oraz wyższymi w jej środkowej części. Różnice pomiędzy spółkami dotyczą głównie skali oraz zróżnicowania pomiędzy dniami tygodnia. W przypadku spółki A zmienność sezonowej składowej w trakcie sesji oraz różnice pomiędzy dniami tygodnia są wyraźniejsze, natomiast dla spółki E przebiegi są bardziej wyrównane.
+
+```{r}
+daneA_sesja <- daneA_sesja %>%
+  select(-any_of("trade_durationAdj")) %>%
+  left_join(daneA_diurAdj %>%
+              mutate(godz = as_hms(time)) %>% group_by(godz) %>%
+              summarise(trade_durationAdj = mean(adjDur), .groups = "drop"),
+            by = "godz")
+
+daneE_sesja <- daneE_sesja %>%
+  select(-any_of("trade_durationAdj")) %>%
+  left_join(daneE_diurAdj %>%
+              mutate(godz = as_hms(time)) %>% group_by(godz) %>%
+              summarise(trade_durationAdj = mean(adjDur), .groups = "drop"),
+            by = "godz")
+```
+
+```{r fig.height=3, fig.width=5}
+ggplot() +
+  geom_line(data = daneA_sesja, 
+            aes(godz, trade_durationAdj, linetype = "spółka A"), linewidth = 0.3) +
+  geom_line(data = daneE_sesja, 
+            aes(godz, trade_durationAdj, linetype = "spółka E"), linewidth = 0.3) +
+  theme_linedraw(base_size = 7) +
+  scale_x_time(date_breaks = "1 hour", date_labels = "%H:%M") +
+  labs(title = "Przekrojowe średnie transakcyjnych czasów trwania (po modyfikacji)",
+       y = "czas trwania [s]") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_blank(), legend.title = element_blank(),
+        legend.position = "bottom")
+```
+
+Dla obu spółek wyznaczono przekrojowe średnie transakcyjnych czasów trwania po usunięciu śróddziennej sezonowości. Po modyfikacji przebiegi czasów trwania oscylują wokół wartości 1 i nie wykazują już wzorca zależnego od pory dnia, co potwierdza skuteczność zastosowanej metody. Niższe wartości czasów trwania na początku i na końcu sesji są zgodne z typową charakterystyką handlu giełdowego, dla których występuje większa aktywność inwestorów.
+
+## Cenowe czasy trwania
+
+### Porównanie czasów trwania
+
+W analizie cenowych czasów trwania, analogicznie jak w przypadku transakcyjnych czasów trwania, dane ograniczono do notowań ciągłych oraz dokonano agregacji jednosekundowej.
+
+Na poniższych wykresach przedstawiono cenowe czasy trwania dla spółek w wybranym dniu, przyjmując próg zmiany ceny równy 0,05.
+
+```{r}
+daneA2_pp <- daneA %>%
+  group_by(data) %>%
+  summarise(cena = sum(cena * vol) / sum(vol), vol = sum(vol), .groups = "drop")
+
+daneA2_pp <- daneA2_pp %>%
+  group_by(grp = as.Date(data)) %>%
+  mutate(event = round(abs(cena - lag(cena)), 2) >= 0.01,
+         price_duration1 = {
+           out <- rep(NA, n()); idx <- which(event)
+           out[idx] <- as.numeric(data[idx] - lag(data[idx]))
+           out }) %>%
+  mutate(event = round(abs(cena - lag(cena)), 2) >= 0.05,
+         price_duration5 = {
+           out <- rep(NA, n()); idx <- which(event)
+           out[idx] <- as.numeric(data[idx] - lag(data[idx]))
+           out }) %>%
+  mutate(event = round(abs(cena - lag(cena)), 2) >= 0.10,
+         price_duration10 = {
+           out <- rep(NA, n()); idx <- which(event)
+           out[idx] <- as.numeric(data[idx] - lag(data[idx]))
+           out }) %>%
+  ungroup() %>%
+  select(-grp, -event)
+
+daneE2_pp <- daneE %>%
+  group_by(data) %>%
+  summarise(cena = sum(cena * vol) / sum(vol), vol = sum(vol), .groups = "drop")
+
+daneE2_pp <- daneE2_pp %>%
+  group_by(grp = as.Date(data)) %>%
+  mutate(event = round(abs(cena - lag(cena)), 2) >= 0.01,
+         price_duration1 = {
+           out <- rep(NA, n()); idx <- which(event)
+           out[idx] <- as.numeric(data[idx] - lag(data[idx]))
+           out }) %>%
+  mutate(event = round(abs(cena - lag(cena)), 2) >= 0.05,
+         price_duration5 = {
+           out <- rep(NA, n()); idx <- which(event)
+           out[idx] <- as.numeric(data[idx] - lag(data[idx]))
+           out }) %>%
+  mutate(event = round(abs(cena - lag(cena)), 2) >= 0.25,
+         price_duration25 = {
+           out <- rep(NA, n()); idx <- which(event)
+           out[idx] <- as.numeric(data[idx] - lag(data[idx]))
+           out }) %>%
+  ungroup() %>%
+  select(-grp, -event)
+```
+
+```{r fig.height=2, fig.width=5}
+ggplot(daneA2_pp %>% filter(as.Date(data) == as.Date("2018-01-04")),
+       aes(x = data, y = price_duration5)) +
+  geom_point(alpha = 0.7) +
+  theme_linedraw(base_size = 7) +
+  scale_x_datetime(date_breaks = "1 hour", date_labels = "%H:%M") +
+  labs(title = "Cenowe czasy trwania - spółka A (04.01.2018, próg cenowy 0,05)",
+       y = "czas trwania [s]") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_blank())
+```
+
+```{r fig.height=2, fig.width=5}
+ggplot(daneE2_pp %>% filter(as.Date(data) == as.Date("2018-01-04")),
+       aes(x = data, y = price_duration5)) +
+  geom_point(alpha = 0.7) +
+  theme_linedraw(base_size = 7) +
+  scale_x_datetime(date_breaks = "1 hour", date_labels = "%H:%M") +
+  labs(title = "Cenowe czasy trwania - spółka E (04.01.2018, próg cenowy 0,05)",
+       y = "czas trwania [s]") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_blank())
+```
+
+Zaobserwowane cenowe czasy trwania, wyznaczone dla przyjętego progu zmiany ceny równego 0,05, charakteryzują się silnym zróżnicowaniem oraz koncentracją obserwacji przy niskich wartościach, przy jednoczesnym występowaniu nielicznych, bardzo długich przerw pomiędzy kolejnymi przekroczeniami progu cenowego. W przypadku spółki A widoczne są skrajnie długie czasy trwania, sięgające około 1500 sekund, pojawiające się głównie w środkowej części sesji. Dla spółki E maksymalne czasy trwania są wyraźnie krótsze i nie przekraczają około 500 sekund, a ich rozkład jest bardziej równomierny w czasie, co wskazuje na stabilniejszy przebieg zmian cen w analizowanym dniu. W obu przypadkach, przy zastosowanym progu cenowym, na początku i na końcu sesji dominują krótsze czasy trwania.
+
+```{r}
+daneA2_pp_5m <- daneA2_pp %>%
+  mutate(data = ceiling_date(data, "5 minutes", change_on_boundary = FALSE)) %>%
+  mutate(data = if_else(data == floor_date(data, "day") + hours(9), 
+                        data + minutes(5), data))
+
+daneE2_pp_5m <- daneE2_pp %>%
+  mutate(data = ceiling_date(data, "5 minutes", change_on_boundary = FALSE)) %>%
+  mutate(data = if_else(data == floor_date(data, "day") + hours(9), 
+                        data + minutes(5), data))
+
+daneA2_sesja <- daneA2_pp_5m %>%
+  group_by(godz = as_hms(data)) %>%
+  summarise(price_duration1 = mean(price_duration1, na.rm = TRUE),
+            price_duration5 = mean(price_duration5, na.rm = TRUE),
+            price_duration10 = mean(price_duration10, na.rm = TRUE))
+
+daneE2_sesja <- daneE2_pp_5m %>%
+  group_by(godz = as_hms(data)) %>%
+  summarise(price_duration1 = mean(price_duration1, na.rm = TRUE),
+            price_duration5 = mean(price_duration5, na.rm = TRUE),
+            price_duration25 = mean(price_duration25, na.rm = TRUE))
+```
+
+```{r}
+rbind(describe(as.numeric(daneA2_pp$price_duration5)),
+      describe(as.numeric(daneE2_pp$price_duration5))) %>%
+  dplyr::select(mean, sd, median, min, max, skew, kurtosis) %>%
+  mutate(kurtosis = kurtosis + 3) %>%
+  set_rownames(c("Spółka A", "Spółka E")) %>%
+  kable(col.names = c("Średnia", "Odch. std.", "Mediana", 
+                      "Min", "Max", "Skośność", "Kurtoza"),
+        caption = "Statystyki opisowe cenowych czasów trwania (próg cenowy 0,05)", digits = 3) %>%
+  kable_styling(full_width = TRUE)
+```
+
+Statystyki opisowe cenowych czasów trwania, wyznaczonych dla progu zmiany ceny równego 0,05, wskazują na silną prawostronną asymetrię rozkładów w obu spółkach. Mediany są istotnie niższe od średnich, co oznacza, że większość zmian cen o zadany próg następuje w relatywnie krótkim czasie, a rozkłady są kształtowane przez nieliczne, długie okresy bez istotnych zmian ceny. Porównanie spółek pokazuje wyraźnie większe zróżnicowanie cenowych czasów trwania w przypadku spółki A. Rozkład ten charakteryzuje się silniejszą asymetrią oraz znacznie częstszym występowaniem obserwacji skrajnych, co potwierdzają wysokie wartości skośności i kurtozy. Wskazuje to na większą nieregularność procesu zmian cen. Dla spółki E rozkład cenowych czasów trwania jest wyraźnie mniej zróżnicowany, z mniejszą liczbą ekstremalnych przerw, co sugeruje bardziej stabilny i równomierny przebieg.
+
+```{r fig.height=3, fig.width=5}
+ggplot() +
+  geom_line(data = daneA2_sesja, 
+            aes(godz, price_duration1, color = "spółka A", linetype = "0,01"), linewidth = 0.3) +
+  geom_line(data = daneE2_sesja, 
+            aes(godz, price_duration1, color = "spółka E", linetype = "0,01"), linewidth = 0.3) +
+  geom_line(data = daneA2_sesja, 
+            aes(godz, price_duration5, color = "spółka A", linetype = "0,05"), linewidth = 0.3) +
+  geom_line(data = daneE2_sesja, 
+            aes(godz, price_duration5, color = "spółka E", linetype = "0,05"), linewidth = 0.3) +
+  theme_linedraw(base_size = 7) +
+  scale_x_time(date_breaks = "1 hour", date_labels = "%H:%M") +
+  scale_color_manual(values = c("spółka A" = "grey20", "spółka E" = "steelblue")) +
+  labs(title = "Przekrojowe średnie cenowych czasów trwania",
+       y = "czas trwania [s]") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_blank(), legend.title = element_blank(),
+        legend.position = "bottom")
+```
+
+Na powyższym wykresie przedstawiono przekrojowe średnie cenowych czasów trwania wyznaczone dla dwóch progów zmiany ceny (0,01 oraz 0,05). Dla obu spółek profile śróddzienne mają zbliżony kształt, z krótszymi czasami trwania na początku i na końcu sesji oraz dłuższymi w jej środkowej części. Przy progu 0,01 przebiegi dla spółek A i E są niemal identyczne, co wskazuje na podobną intensywność niewielkich zmian cen. Zwiększenie progu do 0,05 prowadzi do wyraźnego wzrostu przeciętnych cenowych czasów trwania w przypadku spółki A, natomiast dla spółki E wpływ zmiany progu jest nieznaczny. W rezultacie spółka A charakteryzuje się rzadszym występowaniem większych zmian cen niż spółka E, przy zachowaniu zbliżonego kształtu przekrojowych średnich.
+
+### Modele ACD/LACD
+
+Dla analizowanych spółek przeprowadzono estymację modeli cenowych czasów trwania. W przypadku wykorzystywanych szeregów przyjęto maksymalne wartości progów zmiany ceny zapewniające zachowanie poprawnej struktury danych: 0,10 dla spółki A oraz 0,25 dla spółki E. Przed przystąpieniem do estymacji z szeregów usunięto efekt śróddziennej sezonowości, wykorzystując Elastyczną Formę Fouriera rzędu trzeciego z uwzględnieniem podziału na dni tygodnia sesji.
+
+Rozważono modele typu ACD, LACD1 oraz LACD2, przyjmując rozkłady innowacji: Weibulla, Burra oraz uogólniony rozkład Gamma. Oceny jakości dopasowania modeli dokonano na podstawie testów autokorelacji standaryzowanych reszt oraz ich kwadratów z wykorzystaniem testu Ljunga-Boxa, a także testu zgodności rozkładu innowacji z rozkładem teoretycznym przy użyciu testu Cramera-von Misesa. Dodatkowo porównano wartości kryterium informacyjnego AIC.
+
+Do estymacji modeli wykorzystano podpróbę obejmującą pierwszy kwartał analizowanego okresu, liczącą odpowiednio 11,3 tys. obserwacji (23% próby) dla spółki A oraz 9,6 tys. obserwacji (16% próby) dla spółki E. W tabeli zaprezentowano wyniki estymacji uzyskane dla modeli ACD/LACD(3,1). W trakcie analizy rozważano również modele o niższych rzędach opóźnień, jednak nie spełniały one przyjętych kryteriów oceny.
+
+```{r fig.show='hide', results='hide'}
+daneA2_diurAdj <- diurnalAdj(
+  data.frame(time = daneA2_pp_5m$data, 
+             durations = daneA2_pp_5m$price_duration10) %>% na.omit(),
+  aggregation = "weekdays", method = "FFF", Q = 3)
+
+daneE2_diurAdj <- diurnalAdj(
+  data.frame(time = daneE2_pp_5m$data, 
+             durations = daneE2_pp_5m$price_duration25) %>% na.omit(),
+  aggregation = "weekdays", method = "FFF", Q = 3)
+
+model <- c("ACD", "LACD1", "LACD2")
+dist  <- c("weibull", "burr", "gengamma")
+
+daneA2_acd_fit <- list()
+for (m in model) {
+  for (d in dist) {
+    daneA2_acd_fit[[paste(m, d, sep = "_")]] <- acdFit(
+      durations = daneA2_diurAdj, order = c(3, 1),
+      model = m, dist = d)
+  }
+}
+
+daneE2_acd_fit <- list()
+for (m in model) {
+  for (d in dist) {
+    daneE2_acd_fit[[paste(m, d, sep = "_")]] <- acdFit(
+      durations = daneE2_diurAdj, order = c(3, 1),
+      model = m, dist = d)
+  }
+}
+
+n_A <- daneA2_diurAdj %>% filter(as.Date(time) < "2018-04-01") %>% 
+  summarise(n = n()) %>% pull(n) 
+daneA2_acd_results <- do.call(
+  rbind, lapply(names(daneA2_acd_fit), function(name) {
+    fit <- daneA2_acd_fit[[name]]
+    AIC <- fit$goodnessOfFit["AIC", "value"]
+    LB_res_pval <- Box.test(fit$residuals[1:n_A], lag = 10, type = "Ljung-Box")$p.value %>% round(3)
+    LB_res2_pval <- Box.test(fit$residuals[1:n_A]^2, lag = 10, type = "Ljung-Box")$p.value %>% round(3)
+    u <- standardizeResi(fit, transformation = "probIntegral")
+    CVM_pval <- cvm.test(u[1:n_A])$p.value %>% round(3)
+    data.frame(model = fit$model,
+               dist = fit$distribution,
+               AIC, LB_res_pval, LB_res2_pval, CVM_pval,
+               row.names = NULL)
+  }))
+
+n_E <- daneE2_diurAdj %>% filter(as.Date(time) < "2018-04-01") %>% 
+  summarise(n = n()) %>% pull(n)
+daneE2_acd_results <- do.call(
+  rbind, lapply(names(daneE2_acd_fit), function(name) {
+    fit <- daneE2_acd_fit[[name]]
+    AIC <- fit$goodnessOfFit["AIC", "value"]
+    LB_res_pval <- Box.test(fit$residuals[1:n_E], lag = 10, type = "Ljung-Box")$p.value %>% round(3)
+    LB_res2_pval <- Box.test(fit$residuals[1:n_E]^2, lag = 10, type = "Ljung-Box")$p.value %>% round(3)
+    u <- standardizeResi(fit, transformation = "probIntegral")
+    CVM_pval <- cvm.test(u[1:n_E], "punif")$p.value %>% round(3)
+    data.frame(model = fit$model,
+               dist = fit$distribution,
+               AIC, LB_res_pval, LB_res2_pval, CVM_pval,
+               row.names = NULL)
+  }))
+```
+
+```{r fig.height=3, fig.width=5}
+daneA2_acd_results %>%
+  mutate(across(where(is.numeric), .fns = function(x) {
+  ifelse(as.numeric(x) < 0.001, "<0.001", sprintf("%.3f", as.numeric(x)))
+})) %>%
+  kable(
+    col.names = c("Model", "Rozkład innowacji", "AIC", 
+                  "Reszty standaryzowane", "Kwadraty reszt standaryzowanych", 
+                  "Test Cramera-von Misesa"), 
+    caption = "Wyniki estymacji modeli ACD/LACD(3,1) - spółka A (próg cenowy 0,10)", 
+    digits = 3, align = rep("c", 6)) %>%
+  kable_styling(full_width = TRUE) %>%
+  add_header_above(c(" " = 3, "Test Ljung-Boxa" = 2, " " = 1)) %>%
+  collapse_rows(columns = 1, valign = "middle") %>%
+  row_spec(row = 0, align = "c") %>%
+  row_spec(row = 3, underline = TRUE)
+```
+
+```{r results='hide'}
+daneA2_acd_fit$ACD_gengamma
+```
+
+Na podstawie uzyskanych wyników testów jedynym modelem spełniającym przyjęte wymogi jest model ACD(3,1) z innowacjami o uogólnionym rozkładzie Gamma, postaci:
+
+$$\hat{\psi}_t = 0.00703 + 0.24028\,d_{t-1} - 0.07620\,d_{t-2} - 0.12131\,d_{t-3} + 0.87020\,\hat{\psi}_{t-1} \\ \frac{d_t}{\psi_t} \sim iid \,GG(\kappa, \gamma), \; \kappa = 2.55977, \; \gamma = 0.38095, \; \lambda = \frac{\Gamma(\kappa)}{\Gamma(\kappa + 1/\gamma)}$$
+
+Testy istotności statystycznej potwierdziły istotność wszystkich parametrów modelu.
+
+```{r}
+daneE2_acd_results %>%
+  mutate(across(where(is.numeric), .fns = function(x) {
+  ifelse(as.numeric(x) < 0.001, "<0.001", sprintf("%.3f", as.numeric(x)))
+})) %>%
+  kable(
+    col.names = c("Model", "Rozkład innowacji", "AIC", 
+                  "Reszty standaryzowane", "Kwadraty reszt standaryzowanych", 
+                  "Test Cramera-von Misesa"), 
+    caption = "Wyniki estymacji modeli ACD/LACD(3,1) - spółka E (próg cenowy 0,25)", 
+    digits = 3, align = rep("c", 6)) %>%
+  kable_styling(full_width = TRUE) %>%
+  add_header_above(c(" " = 3, "Test Ljung-Boxa" = 2, " " = 1)) %>%
+  collapse_rows(columns = 1, valign = "middle") %>%
+  row_spec(row = 0, align = "c") %>%
+  row_spec(row = 3, underline = TRUE) %>% 
+  row_spec(row = 9, underline = TRUE)
+```
+
+```{r results='hide'}
+daneE2_acd_fit$ACD_gengamma
+```
+
+Na podstawie uzyskanych wyników testów jedynymi modelami spełniającymi przyjęte wymogi są modele ACD(3,1) oraz LACD2(3,1) z innowacjami o uogólnionym rozkładzie Gamma. Niższą wartość kryterium informacyjnego AIC uzyskano dla modelu ACD, postaci:
+
+$$\hat{\psi}_t = 0.00952 + 0.22439\,d_{t-1} - 0.03501\,d_{t-2} - 0.07636\,d_{t-3} + 0.88733\,\hat{\psi}_{t-1} \\ \frac{d_t}{\psi_t} \sim iid \,GG(\kappa, \gamma), \; \kappa = 2.11311, \; \gamma = 0.44032, \; \lambda = \frac{\Gamma(\kappa)}{\Gamma(\kappa + 1/\gamma)}$$
+
+Testy istotności statystycznej potwierdziły istotność wszystkich parametrów modelu.
+
+### Funkcja hazardu
+
+```{r fig.show='hide'}
+p <- plotHazard(daneA2_acd_fit$ACD_gengamma, xstop = 5)
+p$layers[[3]]$aes_params$colour <- "steelblue"
+```
+
+```{r fig.height=3, fig.width=5}
+p + theme_linedraw(base_size = 7) +
+  labs(title = "Funkcja hazardu uzyskana dla modelu ACD(3,1)\nz innowacjami uogólnionego rozkładu Gamma - spółka A",
+       y = "funkcja hazardu", x = "czas od ostatniej zmiany ceny") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+```
+
+```{r fig.show='hide'}
+p2 <- plotHazard(daneE2_acd_fit$ACD_gengamma, xstop = 5)
+p2$layers[[3]]$aes_params$colour <- "steelblue"
+```
+
+```{r fig.height=3, fig.width=5}
+p2 + theme_linedraw(base_size = 7) +
+  labs(title = "Funkcja hazardu uzyskana dla modelu ACD(3,1)\nz innowacjami uogólnionego rozkładu Gamma - spółka E",
+       y = "funkcja hazardu", x = "czas od ostatniej zmiany ceny") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+```
+
+Na powyższych wykresach przedstawiono funkcje hazardu wyznaczone dla modeli ACD(3,1) z innowacjami o uogólnionym rozkładzie Gamma. W przypadku obu spółek funkcje hazardu mają charakter malejący, co oznacza, że warunkowe prawdopodobieństwo wystąpienia kolejnej zmiany ceny w krótkim przedziale czasu jest najwyższe bezpośrednio po poprzedniej zmianie i maleje wraz z upływem czasu bez zmiany ceny. Innymi słowy, im dłużej cena pozostaje niezmieniona, tym mniejsza jest intensywność wystąpienia kolejnej zmiany w najbliższej chwili. Dla obu spółek widoczne jest dobre dopasowanie krzywej teoretycznej do punktów empirycznych, co wskazuje, że wybrany model poprawnie opisuje rozkład cenowych czasów trwania.
