@@ -1,0 +1,731 @@
+---
+title: "Mikrostruktura rynków finansowych"
+author: |
+  Sebastian Szklarski, Wiktor Suchoński-Romaniuk,  
+  Wiktoria Wróbel, Maciej Więcek
+output:
+  html_document:
+    math_method:
+      engine: katex
+    theme: bootstrap
+    df_print: paged
+    toc: true
+    toc_float:
+      smooth_scroll: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+knitr::opts_chunk$set(fig.align = "center")
+knitr::opts_chunk$set(dpi = 200)
+
+library(dplyr)
+library(lubridate)
+library(psych)
+library(magrittr)
+library(kableExtra)
+library(ggplot2)
+library(stats)
+library(nortest)
+library(hms)
+library(forecast)
+library(rugarch)
+```
+
+## Analiza danych transakcyjnych
+
+### Porównanie danych transakcyjnych
+
+W analizie wykorzystano dane transakcyjne typu tick-by-tick dla spółek A i E, na podstawie których porównano podstawowe statystyki opisowe dotyczące ceny i wolumenu pojedynczej transakcji, odstępów czasowych pomiędzy kolejnymi transakcjami, liczby transakcji w trakcie jednej sesji giełdowej oraz dziennego wolumenu i wartości obrotu.
+
+```{r}
+daneA <- read.csv("spolkaA.csv", sep = ";")
+daneA <- daneA %>%
+  mutate(data = ymd_hms(paste0(daty, sprintf("%06d", godz)))) %>%
+  filter(data >= floor_date(data, "day") + hours(9),
+         data <= floor_date(data, "day") + hours(17) + minutes(5)) %>%
+  dplyr::select(data, cena, vol)
+
+daneE <- read.csv("spolkaE.csv", sep = ";")
+daneE <- daneE %>%
+  mutate(data = ymd_hms(paste0(daty, sprintf("%06d", godz)))) %>%
+  filter(data >= floor_date(data, "day") + hours(9),
+         data <= floor_date(data, "day") + hours(17) + minutes(5)) %>%
+  dplyr::select(data, cena, vol)
+```
+
+```{r}
+rbind(
+  describe(daneA$cena),
+  describe(daneA$vol),
+  describe(daneA %>% group_by(floor_date(data, "day")) %>%
+             reframe(diff = as.numeric(diff(data))) %>% pull(diff)),
+  describe(daneA %>% group_by(floor_date(data, "day")) %>% 
+             summarise(n = n()) %>% pull(n)),
+  describe(daneA %>% group_by(floor_date(data, "day")) %>% 
+             summarise(volume = sum(vol) / 1e3, turnover = sum(vol * cena) / 1e6) %>%
+             select(volume, turnover))) %>%
+  dplyr::select(mean, sd, median, min, max, skew, kurtosis) %>%
+  mutate(kurtosis = kurtosis + 3) %>%
+  set_rownames(c("Cena transakcji", "Wolumen transakcji",
+                 "Czas między transakcjami", "Liczba transakcji w sesji",
+                 "Dzienny wolumen (tys.)", "Dzienna wartość obrotu (mln)")) %>%
+  kable(col.names = c("Średnia", "Odch. std.", "Mediana", 
+                      "Min", "Max", "Skośność", "Kurtoza"),
+        caption = "Statystyki opisowe danych transakcyjnych - spółka A", digits = 3)
+```
+
+```{r}
+rbind(
+  describe(daneE$cena),
+  describe(daneE$vol),
+  describe(daneE %>% group_by(floor_date(data, "day")) %>%
+             reframe(diff = as.numeric(diff(data))) %>% pull(diff)),
+  describe(daneE %>% group_by(floor_date(data, "day")) %>% 
+             summarise(n = n()) %>% pull(n)),
+  describe(daneE %>% group_by(floor_date(data, "day")) %>% 
+             summarise(volume = sum(vol) / 1e3, turnover = sum(vol * cena) / 1e6) %>%
+             select(volume, turnover))) %>%
+  dplyr::select(mean, sd, median, min, max, skew, kurtosis) %>%
+  mutate(kurtosis = kurtosis + 3) %>%
+  set_rownames(c("Cena transakcji", "Wolumen transakcji",
+                 "Czas między transakcjami", "Liczba transakcji w sesji",
+                 "Dzienny wolumen (tys.)", "Dzienna wartość obrotu (mln)")) %>%
+  kable(col.names = c("Średnia", "Odch. std.", "Mediana", 
+                      "Min", "Max", "Skośność", "Kurtoza"),
+        caption = "Statystyki opisowe danych transakcyjnych - spółka E", digits = 3)
+```
+
+Spółka A charakteryzuje się niestabilną strukturą przepływów, z silną koncentracją wolumenu w nielicznych, bardzo dużych transakcjach oraz dużą zmiennością dziennego obrotu, co wskazuje na istotny wpływ pojedynczych zleceń na warunki handlu. Rozkład czasu między transakcjami sugeruje nieregularną aktywność i występowanie okresów skokowego wzrostu intensywności obrotu. Spółka E wykazuje bardziej równomierny rozkład wolumenu i dziennej aktywności, mniejszą podatność na obserwacje skrajne oraz stabilniejszą intensywność handlu przy porównywalnej liczbie transakcji w sesji. W porównaniu do spółki A, rynek spółki E cechuje się wyższą przewidywalnością warunków obrotu i bardziej uporządkowaną strukturą.
+
+### Własności stóp zwrotu
+
+Dla analizowanych danych dokonano agregacji do danych 1-sekundowych. Następnie na ich podstawie wyznaczono logarytmiczne stopy zwrotu i zbadano ich podstawowe własności, w tym zgodność z rozkładem normalnym oraz istotność autokorelacji.
+
+```{r}
+daneA_1s <- daneA %>%
+  group_by(data) %>%
+  summarise(
+    cena = sum(cena * vol) / sum(vol),
+    vol = sum(vol),
+    .groups = "drop")
+
+daneA_1s <- daneA_1s %>%
+  mutate(stopa = (log(cena) - log(lag(cena))) * 100) %>%
+  slice(-1)
+
+daneE_1s <- daneE %>%
+  group_by(data) %>%
+  summarise(
+    cena = sum(cena * vol) / sum(vol),
+    vol = sum(vol),
+    .groups = "drop")
+
+daneE_1s <- daneE_1s %>%
+  mutate(stopa = (log(cena) - log(lag(cena))) * 100) %>%
+  slice(-1)
+```
+
+```{r fig.height=2.5, fig.width=5}
+ggplot(daneA_1s %>% filter(as.Date(data) == as.Date("2018-01-04")),
+       aes(x = data, y = stopa)) +
+  geom_line(linewidth = 0.2, alpha = 0.7) +
+  theme_linedraw(base_size = 7) +
+  scale_x_datetime(date_breaks = "1 hour", date_labels = "%H:%M") +
+  labs(title = "Stopy zwrotu - spółka A (04.01.2018)",
+       y = "stopa zwrotu [%]") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_blank())
+```
+
+```{r fig.height=2.5, fig.width=5}
+ggplot(daneE_1s %>% filter(as.Date(data) == as.Date("2018-01-04")),
+       aes(x = data, y = stopa)) +
+  geom_line(linewidth = 0.2, alpha = 0.7) +
+  theme_linedraw(base_size = 7) +
+  scale_x_datetime(date_breaks = "1 hour", date_labels = "%H:%M") +
+  labs(title = "Stopy zwrotu - spółka E (04.01.2018)",
+       y = "stopa zwrotu [%]") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_blank())
+```
+
+```{r}
+rbind(describe(daneA_1s$stopa),
+      describe(daneE_1s$stopa)) %>%
+  dplyr::select(mean, sd, median, min, max, skew, kurtosis) %>%
+  mutate(kurtosis = kurtosis + 3) %>%
+  set_rownames(c("Spółka A", "Spółka E")) %>%
+  kable(col.names = c("Średnia", "Odch. std.", "Mediana", 
+                      "Min", "Max", "Skośność", "Kurtoza"),
+        caption = "Statystyki opisowe stóp zwrotu", digits = 3)
+```
+
+Stopy zwrotu obu spółek są skupione wokół zera, przy porównywalnym poziomie zmienności, nieco wyższym dla spółki E. W obu przypadkach występuje bardzo duża liczba obserwacji skrajnych, co potwierdzają skrajnie wysokie wartości kurtozy. Rozkłady są nieznacznie asymetryczne, wyraźnie odbiegające od rozkładu normalnego, co jest zgodne z charakterem analizowanych danych.
+
+---
+
+```{r fig.height=2.5, fig.width=5}
+daneA_1s_01_2018 <- daneA_1s %>% 
+  filter(as.Date(data) >= as.Date("2018-01-01"),
+         as.Date(data) <= as.Date("2018-01-31"))
+
+ggplot(daneA_1s_01_2018, aes(x = stopa)) +
+  geom_density(linewidth = 0.4) +
+  theme_linedraw(base_size = 7) +
+  labs(title = "Rozkład stóp zwrotu - spółka A (01.2018)", 
+       y = "gęstość", x = "stopa zwrotu [%]") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_blank())
+```
+
+```{r fig.height=2.5, fig.width=5}
+daneE_1s_01_2018 <- daneE_1s %>% 
+  filter(as.Date(data) >= as.Date("2018-01-01"),
+         as.Date(data) <= as.Date("2018-01-31"))
+
+ggplot(daneE_1s_01_2018, aes(x = stopa)) +
+  geom_density(linewidth = 0.4) +
+  theme_linedraw(base_size = 7) +
+  labs(title = "Rozkład stóp zwrotu - spółka E (01.2018)", 
+       y = "gęstość", x = "stopa zwrotu [%]") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_blank())
+```
+
+```{r}
+daneA_ks_test <- ks.test(daneA_1s_01_2018$stopa, "pnorm", 
+        mean(daneA_1s_01_2018$stopa), sd(daneA_1s_01_2018$stopa))
+daneA_ad_test <- ad.test(daneA_1s_01_2018$stopa)
+
+daneE_ks_test <- ks.test(daneE_1s_01_2018$stopa, "pnorm", 
+        mean(daneE_1s_01_2018$stopa), sd(daneE_1s_01_2018$stopa))
+daneE_ad_test <- ad.test(daneE_1s_01_2018$stopa)
+
+data.frame(spolka = c("A", "A", "E", "E"),
+           test = c("Andersona-Darlinga", "Kolmogorova-Smirnova",
+                    "Andersona-Darlinga", "Kolmogorova-Smirnova"),
+           statystyka = c(daneA_ad_test$statistic,
+                         daneA_ks_test$statistic,
+                         daneE_ad_test$statistic,
+                         daneE_ks_test$statistic),
+           p_value = c(daneA_ad_test$p.value,
+                         daneA_ks_test$p.value,
+                         daneE_ad_test$p.value,
+                         daneE_ks_test$p.value)) %>%
+  mutate(p_value = ifelse(p_value < 2.2e-16, "< 2.2e-16",
+                          formatC(p_value, format = "e", digits = 2))) %>% 
+  kable(col.names = c("Spółka", "Test", "Statystyka", "p-value"),
+        caption = "Wyniki testów normalności", digits = 3, 
+        align = c("c", "c", "r", "r")) %>%
+  collapse_rows(columns = 1, valign = "middle") %>%
+  kable_styling()
+```
+
+Testy normalności Andersona-Darlinga oraz Kolmogorova-Smirnova wskazują na odrzucenie hipotezy zerowej dla obu spółek. Uzyskane wyniki testów, wraz z wcześniej wyznaczonymi statystykami opisowymi, potwierdzają brak normalności rozkładu analizowanych jednosekundowych stóp zwrotu.
+
+---
+
+```{r fig.height=2.5, fig.width=5}
+ggAcf(daneA_1s %>% filter(as.Date(data) >= as.Date("2018-01-01"),
+                          as.Date(data) <= as.Date("2018-01-31")) %>% 
+    pull(stopa), lag.max = 100) +
+  labs(title = "Autokorelacja stóp zwrotu - spółka A (01.2018)",
+    x = "opóźnienie") +
+  theme_linedraw(base_size = 7) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+```
+
+```{r fig.height=2.5, fig.width=5}
+ggAcf(daneE_1s %>% filter(as.Date(data) >= as.Date("2018-01-01"),
+                          as.Date(data) <= as.Date("2018-01-31")) %>% 
+    pull(stopa), lag.max = 100) +
+  labs(title = "Autokorelacja stóp zwrotu - spółka E (01.2018)",
+    x = "opóźnienie") +
+  theme_linedraw(base_size = 7) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+```
+
+Autokorelacje jednosekundowych stóp zwrotu są w większości opóźnień nieistotne statystycznie. Dla obu spółek widoczna jest istotna ujemna autokorelacja pierwszego rzędu, natomiast dla dalszych opóźnień zależności są słabe i nieregularne. Wyniki wskazują na ograniczoną zależność jednosekundowych stóp zwrotu w czasie.
+
+## Analiza danych 5-minutowych
+
+### Przekrojowe średnie stóp zwrotu
+
+```{r}
+daneA_5m <- daneA %>%
+  mutate(data = ceiling_date(data, "5 minutes", change_on_boundary = FALSE)) %>%
+  mutate(data = if_else(data == floor_date(data, "day") + hours(9), 
+                        data + minutes(5), data)) %>%
+  mutate(data = if_else(data == floor_date(data, "day") + hours(17), 
+                        data + minutes(5), data)) %>%
+  group_by(data) %>%
+  summarise(cena = last(cena),
+            n = n(),
+            vol = log(sum(vol)))
+
+daneA_5m <- daneA_5m %>%
+  group_by(grp = as.Date(data)) %>%
+  mutate(stopa = (log(cena) - log(lag(cena))) * 100) %>%
+  ungroup() %>%
+  dplyr::select(-grp)
+
+daneA_sesja <- daneA_5m %>%
+  group_by(godz = as_hms(data)) %>%
+  summarise(
+    n = mean(n),
+    vol = mean(vol),
+    stopa_mean = mean(stopa, na.rm = TRUE),
+    stopa_abs = mean(abs(stopa), na.rm = TRUE))
+```
+
+```{r}
+daneE_5m <- daneE %>%
+  mutate(data = ceiling_date(data, "5 minutes", change_on_boundary = FALSE)) %>%
+  mutate(data = if_else(data == floor_date(data, "day") + hours(9), 
+                        data + minutes(5), data)) %>%
+  mutate(data = if_else(data == floor_date(data, "day") + hours(17), 
+                        data + minutes(5), data)) %>%
+  group_by(data) %>%
+  summarise(cena = last(cena),
+            n = n(),
+            vol = log(sum(vol)))
+
+daneE_5m <- daneE_5m %>%
+  group_by(grp = as.Date(data)) %>%
+  mutate(stopa = (log(cena) - log(lag(cena))) * 100) %>%
+  ungroup() %>%
+  dplyr::select(-grp)
+
+daneE_sesja <- daneE_5m %>%
+  group_by(godz = as_hms(data)) %>%
+  summarise(
+    n = mean(n),
+    vol = mean(vol),
+    stopa_mean = mean(stopa, na.rm = TRUE),
+    stopa_abs = mean(abs(stopa), na.rm = TRUE))
+```
+
+```{r fig.height=2.5, fig.width=5}
+ggplot(daneA_sesja, aes(godz, stopa_mean)) +
+  geom_line(linewidth = 0.3) +
+  theme_linedraw(base_size = 7) +
+  scale_x_time(date_breaks = "1 hour", date_labels = "%H:%M") +
+  labs(title = "Przekrojowe średnie 5-minutowych stóp zwrotu - spółka A",
+       y = "stopa zwrotu [%]") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_blank())
+```
+
+```{r fig.height=2.5, fig.width=5}
+ggplot(daneE_sesja, aes(godz, stopa_mean)) +
+  geom_line(linewidth = 0.3) +
+  theme_linedraw(base_size = 7) +
+  scale_x_time(date_breaks = "1 hour", date_labels = "%H:%M") +
+  labs(title = "Przekrojowe średnie 5-minutowych stóp zwrotu - spółka E",
+       y = "stopa zwrotu [%]") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_blank())
+```
+
+Przekrojowe średnie 5-minutowych stóp zwrotu dla obu spółek oscylują wokół zera w całym przebiegu sesji, bez trwałych wzorców czasowych. Obserwowane wahania mają charakter nieregularny i nie wskazują na systematyczne różnice pomiędzy poszczególnymi przedziałami czasowymi.
+
+### Przekrojowe średnie liczby transakcji
+
+```{r fig.height=2.5, fig.width=5}
+ggplot(daneA_sesja, aes(godz, n)) +
+  geom_line(linewidth = 0.3) +
+  theme_linedraw(base_size = 7) +
+  scale_x_time(date_breaks = "1 hour", date_labels = "%H:%M") +
+  labs(title = "Przekrojowe średnie liczby transakcji\nw 5-minutowych przedziałach czasowych - spółka A",
+       y = "liczba transakcji") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_blank())
+```
+
+```{r fig.height=2.5, fig.width=5}
+ggplot(daneE_sesja, aes(godz, n)) +
+  geom_line(linewidth = 0.3) +
+  theme_linedraw(base_size = 7) +
+  scale_x_time(date_breaks = "1 hour", date_labels = "%H:%M") +
+  labs(title = "Przekrojowe średnie liczby transakcji\nw 5-minutowych przedziałach czasowych - spółka E",
+       y = "liczba transakcji") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_blank())
+```
+
+Dla obu spółek widoczny jest wyraźny U-kształtny przebieg liczby transakcji w trakcie sesji, z wysoką aktywnością na otwarciu i zamknięciu oraz obniżeniem intensywności handlu w trakcie dnia. Kształt profilu jest zbliżony dla obu spółek, co wskazuje na typowy śróddzienny charakter aktywności transakcyjnej.
+
+### Przekrojowe średnie wolumenu
+
+```{r fig.height=2.5, fig.width=5}
+ggplot(daneA_sesja, aes(godz, vol)) +
+  geom_line(linewidth = 0.3) +
+  theme_linedraw(base_size = 7) +
+  scale_x_time(date_breaks = "1 hour", date_labels = "%H:%M") +
+  labs(title = "Przekrojowe średnie zlogarytmowanego wolumenu\nw 5-minutowych przedziałach czasowych - spółka A",
+       y = "zlogarytmowany wolumen") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_blank())
+```
+
+```{r fig.height=2.5, fig.width=5}
+ggplot(daneE_sesja, aes(godz, vol)) +
+  geom_line(linewidth = 0.3) +
+  theme_linedraw(base_size = 7) +
+  scale_x_time(date_breaks = "1 hour", date_labels = "%H:%M") +
+  labs(title = "Przekrojowe średnie zlogarytmowanego wolumenu\nw 5-minutowych przedziałach czasowych - spółka E",
+       y = "zlogarytmowany wolumen") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_blank())
+```
+
+Przekrojowe średnie zlogarytmowanego wolumenu wykazują zależność od czasu trwania sesji, analogiczną do liczby transakcji. Najniższe poziomy wolumenu obserwowane są w środku dnia, natomiast istotny wzrost następuje w końcowej fazie sesji.
+
+### Zmienność sezonowa
+
+```{r fig.height=2.5, fig.width=5}
+ggplot(daneA_sesja, aes(godz, stopa_abs)) +
+  geom_line(linewidth = 0.3) +
+  theme_linedraw(base_size = 7) +
+  scale_x_time(date_breaks = "1 hour", date_labels = "%H:%M") +
+  labs(title = "Przekrojowe średnie z wartości bezwzględnych\n5-minutowych stóp zwrotu - spółka A",
+       y = "stopa") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_blank())
+```
+
+```{r fig.height=2.5, fig.width=5}
+ggplot(daneE_sesja, aes(godz, stopa_abs)) +
+  geom_line(linewidth = 0.3) +
+  theme_linedraw(base_size = 7) +
+  scale_x_time(date_breaks = "1 hour", date_labels = "%H:%M") +
+  labs(title = "Przekrojowe średnie z wartości bezwzględnych\n5-minutowych stóp zwrotu - spółka E",
+       y = "stopa") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_blank())
+```
+
+Przekrojowe średnie wartości bezwzględnych 5-minutowych stóp zwrotu wykazują wyraźny U-kształtny profil zmienności dla obu spółek. Zmienność jest najwyższa na otwarciu i zamknięciu sesji oraz najniższa w jej środkowej części, co potwierdza obecność silnej śróddziennej sezonowości zmienności.
+
+## Modelowanie zmienności danych śróddziennych
+
+### Elastyczna Forma Fouriera
+
+```{r}
+daneA2 <- read.csv("spolkaA.csv", sep = ";")
+daneA2 <- daneA2 %>%
+  mutate(data = ymd_hms(paste0(daty, sprintf("%06d", godz)))) %>%
+  filter(data >= floor_date(data, "day") + hours(9),
+         data <= floor_date(data, "day") + hours(16) + minutes(50)) %>%
+  dplyr::select(data, cena, vol)
+
+daneA2_5m <- daneA2 %>%
+  mutate(data = ceiling_date(data, "5 minutes", change_on_boundary = FALSE)) %>%
+  mutate(data = if_else(data == floor_date(data, "day") + hours(9), 
+                        data + minutes(5), data)) %>%
+  group_by(data) %>%
+  summarise(cena = last(cena),
+            n = n(),
+            vol = log(sum(vol)))
+
+daneA2_stopy_dzienne <- daneA2 %>%
+  group_by(data = floor_date(data, "day")) %>%
+  summarise(stopa = (log(last(cena)) - log(first(cena))) * 100)
+sigma_t <- sd(daneA2_stopy_dzienne$stopa)
+
+dane_FFF <- daneA2_5m %>%
+  group_by(grp = as.Date(data)) %>%
+  mutate(t = cur_group_id()) %>%
+  ungroup() %>%
+  select(-grp)
+
+dane_FFF <- dane_FFF %>%
+  group_by(t) %>%
+  mutate(d = row_number() - 1) %>%
+  ungroup()
+
+dane_FFF <- dane_FFF %>%
+  group_by(t) %>%
+  mutate(r_td = log(cena) - log(lag(cena))) %>%
+  ungroup()
+
+dane_FFF <- dane_FFF %>%
+  group_by(d) %>%
+  mutate(R_bar_d = mean(r_td, na.rm = TRUE)) %>%
+  ungroup()
+
+D <- max(dane_FFF$d)
+D1 <- (D + 1) / 2
+D2 <- (D + 1) * (D + 2) / 6
+
+dane_FFF <- dane_FFF %>%
+  mutate(Y = 2 * log(abs(r_td - R_bar_d) / (sigma_t / sqrt(D))))
+
+dane_FFF <- dane_FFF %>% na.omit()
+  
+dane_FFF <- dane_FFF %>%
+  mutate(trend1 = d / D1, trend2 = d^2 / D2) 
+
+for (p in 1:10) {
+  dane_FFF[[paste0("cos_", p)]] <- cos(2 * pi * p * dane_FFF$d / D)
+  dane_FFF[[paste0("sin_", p)]] <- sin(2 * pi * p * dane_FFF$d / D)
+}
+
+FFF_kryteria <- data.frame(p = 1:10, AIC = NA, BIC = NA)
+for (p in 1:10) {
+  formula <- as.formula(
+    paste("Y ~ trend1 + trend2 +",
+          paste(c(paste0("cos_", 1:p), paste0("sin_", 1:p)), collapse = " + ")))
+  model <- lm(formula, data = dane_FFF)
+  FFF_kryteria$AIC[p] <- AIC(model); FFF_kryteria$BIC[p] <- BIC(model)
+}
+
+model_FFF <- lm(Y ~ trend1 + trend2 + 
+                  cos_1 + sin_1 + 
+                  cos_2 + sin_2 +
+                  cos_3 + sin_3, data = dane_FFF)
+
+dane_FFF <- dane_FFF %>%
+  mutate(weekday = weekdays(as.Date(data)),
+    mon = as.integer(weekday == "Monday"),
+    tue = as.integer(weekday == "Tuesday"),
+    wed = as.integer(weekday == "Wednesday"),
+    thu = as.integer(weekday == "Thursday")) %>%
+  dplyr::select(-weekday)
+
+model_FFF_binarne <- lm(Y ~ trend1 + trend2 + 
+                          mon + tue + wed + thu +
+                          cos_1 + sin_1 + 
+                          cos_2 + sin_2 +
+                          cos_3 + sin_3, data = dane_FFF)
+```
+
+```{r results='hide'}
+AIC(model_FFF)
+AIC(model_FFF_binarne)
+BIC(model_FFF)
+BIC(model_FFF_binarne)
+anova(model_FFF, model_FFF_binarne)
+```
+
+```{r}
+dane_FFF <- dane_FFF %>% 
+  mutate(f_hat = predict(model_FFF))
+
+dane_FFF <- dane_FFF %>%
+  mutate(s_hat_td = n() * exp(f_hat / 2) / sum(exp(f_hat / 2)))
+
+daneA2_5m <- daneA2_5m %>%
+  group_by(grp = as.Date(data)) %>%
+  mutate(stopa = (log(cena) - log(lag(cena))) * 100) %>%
+  ungroup() %>%
+  dplyr::select(-grp)
+
+daneA2_5m <- daneA2_5m %>%
+  left_join(dane_FFF %>% select(data, s_hat_td), by = "data")
+
+daneA2_5m <- daneA2_5m %>%
+  mutate(stopa_odsezonowana = stopa / s_hat_td)
+```
+
+Dla spółki A zastosowano metodę usuwania śróddziennej sezonowości zmienności opartą na Elastycznej Formie Fouriera. Analiza została przeprowadzona na 5-minutowych stopach zwrotu, przy czym jako estymator dziennej zmienności przyjęto wariancję dziennych stóp zwrotu obliczanych pomiędzy otwarciem a zamknięciem sesji giełdowej.<br><br>
+Rząd rozwinięcia Fouriera dobrano na podstawie kryteriów informacyjnych. Kryterium AIC osiągało najmniejszą wartość dla P = 10, natomiast kryterium BIC dla P = 3. Aby uniknąć nadmiernego dopasowania śróddziennego profilu zmienności, w dalszej analizie ograniczono się do trzeciego rzędu Fouriera, zgodnie z kryterium BIC.<br><br>Po ustaleniu rzędu Fouriera rozważono uwzględnienie zmiennych binarnych dla dni tygodnia. Porównanie modeli z i bez zmiennych binarnych przeprowadzono przy wykorzystaniu testu F, który nie wykazał istotnej poprawy (p-value = 0.43). Również wartości kryteriów informacyjnych nie wykazały znacznej różnicy pomiędzy modelami, w związku z czym w dalszej analizie wykorzystano model bez zmiennych binarnych.<br><br>Na poniższych wykresach porównano przekrojowe średnie z modułów 5-minutowych stóp zwrotu oraz autokorelacje wartości bezwzględnych 5-minutowych stóp zwrotu przed i po usunięciu śróddziennej sezonowości. Dodatkowo przedstawiono wykres przeciętnych wartości składowej sezonowej zmienności w trakcie sesji.
+
+```{r fig.height=2.5, fig.width=5}
+ggAcf(daneA2_5m %>% na.omit() %>% mutate(stopa = abs(stopa)) %>% 
+        pull(stopa), lag.max = 300) +
+  labs(title = "Autokorelacja wartości bezwzględnych\n5-minutowych stóp zwrotu (przed modyfikacją)",
+       x = "opóźnienie") +
+  theme_linedraw(base_size = 7) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+```
+
+```{r fig.height=2.5, fig.width=5}
+ggAcf(daneA2_5m %>% na.omit() %>% mutate(stopa = abs(stopa_odsezonowana)) %>% 
+        pull(stopa), lag.max = 300) +
+  labs(title = "Autokorelacja wartości bezwzględnych\n5-minutowych stóp zwrotu (po modyfikacji)",
+       x = "opóźnienie") +
+  theme_linedraw(base_size = 7) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+```
+
+```{r}
+daneA2_sesja <- daneA2_5m %>% 
+  group_by(godz = as_hms(data)) %>% 
+  summarise(stopa_abs = mean(abs(stopa), na.rm = TRUE),
+            stopa_odsezonowana_abs = mean(abs(stopa_odsezonowana), na.rm = TRUE),
+            s_hat_d = mean(s_hat_td, na.rm = TRUE))
+```
+
+```{r fig.height=2.5, fig.width=5}
+ggplot(daneA2_sesja, aes(godz, stopa_abs)) +
+  geom_line(linewidth = 0.3) +
+  theme_linedraw(base_size = 7) +
+  scale_x_time(date_breaks = "1 hour", date_labels = "%H:%M") +
+  labs(title = "Przekrojowe średnie z wartości bezwzględnych\n5-minutowych stóp zwrotu (przed modyfikacją)",
+       y = "stopa zwrotu [%]") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_blank())
+```
+
+```{r fig.height=2.5, fig.width=5}
+ggplot(daneA2_sesja, aes(godz, stopa_odsezonowana_abs)) +
+  geom_line(linewidth = 0.3) +
+  theme_linedraw(base_size = 7) +
+  scale_x_time(date_breaks = "1 hour", date_labels = "%H:%M") +
+  labs(title = "Przekrojowe średnie z wartości bezwzględnych\n5-minutowych stóp zwrotu (po modyfikacji)",
+       y = "stopa zwrotu [%]") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_blank())
+```
+
+```{r fig.height=2.5, fig.width=5}
+ggplot(daneA2_sesja, aes(godz, s_hat_d)) +
+  geom_line(linewidth = 0.3) +
+  theme_linedraw(base_size = 7) +
+  scale_x_time(date_breaks = "1 hour", date_labels = "%H:%M") +
+  labs(title = "Przeciętna wartość estymatora\nsezonowej składowej śróddziennej zmienności",
+       y = "średnia składowa estymatora") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_blank())
+```
+
+Zastosowanie Elastycznej Formy Fouriera umożliwiło usunięcie śróddziennej sezonowości zmienności dla spółki A. Przed modyfikacją obserwowana była silna i regularna autokorelacja wartości bezwzględnych 5-minutowych stóp zwrotu oraz wyraźny U-kształtny profil przekrojowych średnich zmienności. Po usunięciu składnika sezonowego autokorelacje uległy istotnemu osłabieniu, a przekrojowe średnie zostały wyraźnie spłaszczone. Wyznaczona sezonowa składowa zmienności odzwierciedla typowy przebieg śróddzienny z podwyższoną zmiennością na otwarciu i zamknięciu sesji.
+
+### Model multiplikatywny Engle i Sokalskiej
+
+Dla spółki E zastosowano metodę usuwania śróddziennej sezonowości zmienności opartą na modelu multiplikatywnym Engle i Sokalskiej. Analiza została przeprowadzona na 5-minutowych stopach zwrotu, przy czym do estymacji dziennej zmienności wykorzystano model ARMA-GARCH dopasowany do dziennych stóp zwrotu obliczanych pomiędzy otwarciem a zamknięciem sesji giełdowej.<br><br>Specyfikację modelu dobrano na podstawie kryteriów informacyjnych. Kryteria AIC oraz BIC osiągnęły najmniejsze wartości dla modelu ARMA(2,2)-GARCH(1,1), który został przyjęty jako ostateczny model opisujący dynamikę dziennej zmienności i wykorzystany w dalszej analizie.<br><br>Na poniższych wykresach porównano przekrojowe średnie z modułów 5-minutowych stóp zwrotu oraz autokorelacje wartości bezwzględnych 5-minutowych stóp zwrotu przed i po usunięciu śróddziennej sezonowości. Dodatkowo przedstawiono wykres wartości składowej sezonowej zmienności w trakcie sesji.
+
+```{r}
+daneE2 <- read.csv("spolkaE.csv", sep = ";")
+daneE2 <- daneE2 %>%
+  mutate(data = ymd_hms(paste0(daty, sprintf("%06d", godz)))) %>%
+  filter(data >= floor_date(data, "day") + hours(9),
+         data <= floor_date(data, "day") + hours(16) + minutes(50)) %>%
+  dplyr::select(data, cena, vol)
+
+daneE2_stopy_dzienne <- daneE2 %>%
+  group_by(data = floor_date(data, "day")) %>%
+  summarise(stopa = (log(last(cena)) - log(first(cena))) * 100)
+```
+
+```{r eval=FALSE}
+garch_grid <- expand.grid(p = 1:3, q = 1:3, P = 0:3, Q = 0:3)
+garch_grid$AIC <- NA
+garch_grid$BIC <- NA
+
+for (i in 1:nrow(garch_grid)) {
+  spec <- ugarchspec(
+    variance.model = list(model = "sGARCH", 
+                          garchOrder = c(garch_grid$p[i], garch_grid$q[i])),
+    mean.model = list(armaOrder = c(garch_grid$P[i], garch_grid$Q[i]))
+  )
+  fit <- ugarchfit(spec, daneE2_stopy_dzienne)
+  garch_grid$AIC[i] <- infocriteria(fit)[1]
+  garch_grid$BIC[i] <- infocriteria(fit)[2]
+}
+```
+
+```{r}
+spec <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+  mean.model = list(armaOrder = c(2, 2))
+)
+fit <- ugarchfit(spec, daneE2_stopy_dzienne)
+daneE2_stopy_dzienne <- daneE2_stopy_dzienne %>%
+  mutate(sigma = as.numeric(sigma(fit)))
+
+daneE2_5m <- daneE2 %>%
+  mutate(data = ceiling_date(data, "5 minutes", change_on_boundary = FALSE)) %>%
+  mutate(data = if_else(data == floor_date(data, "day") + hours(9), 
+                        data + minutes(5), data)) %>%
+  group_by(data) %>%
+  summarise(cena = last(cena),
+            n = n(),
+            vol = log(sum(vol)))
+
+daneE2_5m <- daneE2_5m %>%
+  group_by(grp = as.Date(data)) %>%
+  mutate(stopa = (log(cena) - log(lag(cena))) * 100) %>%
+  ungroup() %>%
+  dplyr::select(-grp) 
+
+daneE2_5m <- daneE2_5m %>%
+  mutate(grp = as.Date(data)) %>%
+  left_join(daneE2_stopy_dzienne %>% mutate(grp = as.Date(data)) %>% 
+              select(grp, sigma), by = "grp") %>%
+  dplyr::select(-grp)
+
+daneE2_5m <- daneE2_5m %>%
+  group_by(grp = as_hms(data)) %>%
+  mutate(s_d2 = mean(stopa^2 / sigma^2)) %>%
+  ungroup() %>%
+  dplyr::select(-grp)
+
+daneE2_5m <- daneE2_5m %>%
+  mutate(stopa_odsezonowana = stopa / (sigma * sqrt(s_d2)))
+```
+
+```{r fig.height=2.5, fig.width=5}
+ggAcf(daneE2_5m %>% na.omit() %>% mutate(stopa = abs(stopa)) %>% 
+        pull(stopa), lag.max = 300) +
+  labs(title = "Autokorelacja wartości bezwzględnych\n5-minutowych stóp zwrotu (przed modyfikacją)",
+       x = "opóźnienie") +
+  theme_linedraw(base_size = 7) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+```
+
+```{r fig.height=2.5, fig.width=5}
+ggAcf(daneE2_5m %>% na.omit() %>% mutate(stopa = abs(stopa_odsezonowana)) %>% 
+        pull(stopa), lag.max = 300) +
+  labs(title = "Autokorelacja wartości bezwzględnych\n5-minutowych stóp zwrotu (po modyfikacji)",
+       x = "opóźnienie") +
+  theme_linedraw(base_size = 7) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+```
+
+```{r}
+daneE2_sesja <- daneE2_5m %>% 
+  group_by(godz = as_hms(data)) %>% 
+  summarise(stopa_abs = mean(abs(stopa), na.rm = TRUE),
+            stopa_odsezonowana_abs = mean(abs(stopa_odsezonowana), na.rm = TRUE),
+            s_d2 = first(s_d2))
+```
+
+```{r fig.height=2.5, fig.width=5}
+ggplot(daneE2_sesja, aes(godz, stopa_abs)) +
+  geom_line(linewidth = 0.3) +
+  theme_linedraw(base_size = 7) +
+  scale_x_time(date_breaks = "1 hour", date_labels = "%H:%M") +
+  labs(title = "Przekrojowe średnie z wartości bezwzględnych\n5-minutowych stóp zwrotu (przed modyfikacją)",
+       y = "stopa zwrotu [%]") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_blank())
+```
+
+```{r fig.height=2.5, fig.width=5}
+ggplot(daneE2_sesja, aes(godz, stopa_odsezonowana_abs)) +
+  geom_line(linewidth = 0.3) +
+  theme_linedraw(base_size = 7) +
+  scale_x_time(date_breaks = "1 hour", date_labels = "%H:%M") +
+  labs(title = "Przekrojowe średnie z wartości bezwzględnych\n5-minutowych stóp zwrotu (po modyfikacji)",
+       y = "stopa zwrotu [%]") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_blank())
+```
+
+```{r fig.height=2.5, fig.width=5}
+ggplot(daneE2_sesja, aes(godz, s_d2)) +
+  geom_line(linewidth = 0.3) +
+  theme_linedraw(base_size = 7) +
+  scale_x_time(date_breaks = "1 hour", date_labels = "%H:%M") +
+  labs(title = "Wartość estymatora\nsezonowej składowej śróddziennej zmienności",
+       y = "wartość estymatora") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_blank())
+```
+
+Zastosowanie multiplikatywnego modelu Engle i Sokalskiej umożliwiło usunięcie śróddziennej sezonowości zmienności dla spółki E. Przed modyfikacją obserwowana była wyraźna autokorelacja wartości bezwzględnych 5-minutowych stóp zwrotu oraz U-kształtny profil przekrojowych średnich zmienności. Po korekcie autokorelacje uległy osłabieniu, a przekrojowe średnie zostały wyraźnie spłaszczone. Oszacowana sezonowa składowa zmienności potwierdza podwyższoną zmienność na otwarciu i zamknięciu sesji oraz niższy poziom w jej środkowej części.
