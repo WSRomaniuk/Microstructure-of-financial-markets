@@ -1,5 +1,4 @@
-# Microstructure of Financial Markets / Mikrostruktura Rynków Finansowych
-*(Polska wersja poniżej / Polish version below)*
+# Microstructure of Financial Markets
 
 A comprehensive quantitative analysis of the microstructure of financial markets using high-frequency (tick-by-tick) trading data for two selected companies (Spółka A and Spółka E). The project implements advanced econometric models to analyze transaction durations, intraday seasonality, and realized volatility.
 
