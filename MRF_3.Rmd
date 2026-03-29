@@ -1,0 +1,319 @@
+---
+title: "Mikrostruktura rynków finansowych"
+author: |
+  Sebastian Szklarski, Wiktor Suchoński-Romaniuk,  
+  Wiktoria Wróbel, Maciej Więcek
+output:
+  html_document:
+    math_method:
+      engine: katex
+    theme: bootstrap
+    df_print: paged
+    toc: true
+    toc_float:
+      smooth_scroll: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+knitr::opts_chunk$set(fig.align = "center")
+knitr::opts_chunk$set(dpi = 250)
+
+library(dplyr)
+library(lubridate)
+library(psych)
+library(magrittr)
+library(kableExtra)
+library(ggplot2)
+library(hms)
+library(ACDm)
+library(tidyr)
+```
+
+```{r}
+daneA <- read.csv("spolkaA.csv", sep = ";")
+daneA <- daneA %>%
+  mutate(data = ymd_hms(paste0(daty, sprintf("%06d", godz)))) %>%
+  filter(data >= floor_date(data, "day") + hours(9),
+         data <= floor_date(data, "day") + hours(17) + minutes(5)) %>%
+  dplyr::select(data, cena, vol)
+
+daneA_5m <- daneA %>%
+  mutate(data = ceiling_date(data, "5 minutes", change_on_boundary = FALSE)) %>%
+  mutate(data = if_else(data == floor_date(data, "day") + hours(9), 
+                        data + minutes(5), data)) %>%
+  mutate(data = if_else(data == floor_date(data, "day") + hours(17), 
+                        data + minutes(5), data)) %>%
+  group_by(data) %>%
+  summarise(cena = last(cena),
+            n = n(),
+            vol = log(sum(vol)))
+
+daneA_5m <- daneA_5m %>%
+  group_by(grp = as.Date(data)) %>%
+  mutate(stopa = (log(cena) - log(lag(cena))) * 100) %>%
+  ungroup() %>%
+  dplyr::select(-grp)
+```
+
+# Zmienność zrealizowana
+
+Generalnie to liczę zmienność zrealizowaną 3 sposobami. Ważna rzecz n w tabelce zmiennosc to jest liczba obserwacji w danym dniu (tzn. jak były notowania w każdym przedziale to powinno być chyba n=95 obserwacji w zagregowanych do 5 minut danych, ale czasem było mniej.) - to może ci się przydać do opisywania albo nie, nie wiem XD
+
+tutaj jest sposób ze slajdu 11
+```{r}
+daneA_5m$data <- date(daneA_5m$data)
+
+zmiennosc <- daneA_5m %>% 
+  filter(!is.na(stopa)) %>%
+  group_by(data) %>%
+  summarise(
+    sigma_2 = sum(stopa^2),
+    n = n()
+  )
+```
+
+tutaj ze slajdu 12
+```{r}
+ceny <- daneA_5m %>%
+  group_by(data) %>%
+  summarise(
+    otwarcie = first(cena),
+    zamknicie = last(cena)
+  ) %>%
+  ungroup()
+
+zwroty_dzienne <- ceny %>%
+  mutate(
+    r_oc = (log(zamknicie) - log(otwarcie)) * 100,
+    r_co = (log(otwarcie) - log(lag(zamknicie))) * 100
+  )
+
+sigma2_oc <- var(zwroty_dzienne$r_oc, na.rm = TRUE)
+sigma2_co <- var(zwroty_dzienne$r_co, na.rm = TRUE)
+c <- sigma2_co / sigma2_oc
+
+zmiennosc <- zmiennosc %>%
+  mutate(
+    sigma_3 = (1+c) * sigma_2
+  )
+```
+
+a tu ze slajdu 10
+```{r}
+ceny <- ceny %>%
+  mutate(
+    zwrot_nocny = (log(otwarcie) - log(lag(zamknicie)))
+  )
+
+zmiennosc <- zmiennosc %>%
+  mutate(
+    sigma_1 = sigma_2 + ceny$zwrot_nocny^2
+  )
+```
+
+tutaj liczę logarytmiczne dzienne stopy zwrotu (tylko do wykresu)
+```{r}
+ceny <- ceny %>%
+  mutate(
+    dzienna_stopa = (log(zamknicie) - log(lag(zamknicie))) * 100
+  )
+```
+
+tutaj liczę pierwiastek ze zmienności żeby na wykresie była ta sama jednostka co stóp zwrotu. koniecznie popraw wykres bo jest nieczytelny
+```{r}
+zmiennosc <- zmiennosc %>%
+  mutate(sigma_1_sqrt = sqrt(sigma_1),
+         sigma_2_sqrt = sqrt(sigma_2),
+         sigma_3_sqrt = sqrt(sigma_3))
+
+ggplot() +
+  geom_line(data = zmiennosc, 
+            aes(data, sigma_1_sqrt, linetype = "sigma_1"), linewidth = 0.3) +
+  geom_line(data = zmiennosc, 
+            aes(data, sigma_2_sqrt, linetype = "sigma_2"), linewidth = 0.3) +
+  geom_line(data = zmiennosc, 
+            aes(data, sigma_3_sqrt, linetype = "sigma_3"), linewidth = 0.3) +
+  geom_line(data = ceny,
+            aes(data, dzienna_stopa, linetype = "Dzienna stopa zwrotu"), linewidth = 0.3) +
+  theme_linedraw(base_size = 7) +
+  scale_x_date(date_breaks = "3 months", date_labels = "%Y-%m") +
+  labs(title = "Zmienność Zrealizowana - Spółka A",
+       y = "zmienność zrealizowana") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_blank(), legend.title = element_blank(),
+        legend.position = "bottom")
+```
+
+# Wariacja dwupotęgowa
+
+tu liczę wariacje dwupotęgową (dolny wzór ze slajdu 21) i na wykresie porównuję ze zmiennością zrealizowaną (sigma_2)
+wrzuć jakiś kolor do wykresu albo zrób szubidubi żeby było ładnie
+```{r}
+daneA_5m <- daneA_5m %>%
+  mutate(iloczyn_stop = abs(lag(stopa)) * abs(stopa))
+
+bv_dzienny <- daneA_5m %>%
+  filter(!is.na(iloczyn_stop)) %>%
+  group_by(data) %>%
+  summarise(
+    n = n(),
+    suma_iloczynu_stop = sum(iloczyn_stop),
+    BV = (pi/2) * (n / (n-1)) * suma_iloczynu_stop
+  )
+
+ggplot() +
+  geom_line(data = zmiennosc, 
+            aes(data, sigma_2, linetype = "zmiennosc zrealizowana (sigma 2"), linewidth = 0.3) +
+  geom_line(data = bv_dzienny, 
+            aes(data, BV, linetype = "wariancja dwupotegowa (RV)"), linewidth = 0.3) +
+  theme_linedraw(base_size = 7) +
+  scale_x_date(date_breaks = "3 months", date_labels = "%Y-%m") +
+  labs(title = "Porównanie Wariacji Dwupotęgowej i Zmienności Zrealizowanej",
+       y = "wariacja dwupotegowa / zmiennosc zrealizowana") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_blank(), legend.title = element_blank(),
+        legend.position = "bottom")
+```
+
+# Wartosc miary wzglednego skoku
+
+tu liczę wartość miary skoku (wzór na RJ, slajd 26). 
+```{r}
+skoki <- data.frame(
+  data = zmiennosc$data,
+  RJ = (zmiennosc$sigma_2 - bv_dzienny$BV)/zmiennosc$sigma_2
+)
+
+ggplot() +
+  geom_line(data = skoki, 
+            aes(data, RJ, linetype = "względna miara skoku (RJ)"), linewidth = 0.3) +
+  theme_linedraw(base_size = 7) +
+  scale_x_date(date_breaks = "3 months", date_labels = "%Y-%m") +
+  labs(title = "Względna Miara Skoku - Spolka A",
+       y = "względna miara skoku") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_blank(), legend.title = element_blank(),
+        legend.position = "bottom")
+```
+
+# Testy na występowanie skoków w procesie cen
+
+tutaj liczę wariację trójpotęgową  (slajd 23 - TQ) - to jest estymator IQ, czyli czegoś co jest potrzebne do testów. W każdym teście wykorzystałem wariację trójpotęgową jako TQ.
+```{r}
+daneA_5m <- daneA_5m %>%
+  mutate(iloczyn_3stop = abs(lag(lag(stopa)))^(4/3) * abs(lag(stopa))^(4/3) * abs(stopa)^(4/3))
+
+mu <- 2^(2/3) * gamma(7/6) * gamma(1/2)^(-1)
+
+tq_dzienny <- daneA_5m %>%
+  filter(!is.na(iloczyn_3stop)) %>%
+  group_by(data) %>%
+  summarise(
+    n = n(),
+    suma_iloczynu_3stop = sum(iloczyn_3stop),
+    TQ = n * (n / (n-2)) * mu^(-3) * suma_iloczynu_3stop
+  )
+```
+
+tutaj robię testy na występowanie skoków (oparty na różnicach) (slajd 28), jak coś h = 1/n, dlatego podstawiłem n zamiast h
+wykres też do ogarnięcia
+wykres do ogarnięcia (w sumie mogą być następne wykresy jakoś obok siebie bo to są te same hipotezy tylko inaczej się liczy statystyki testowe)
+```{r}
+bns_dzienny <- data.frame(
+  data = zmiennosc$data,
+  rv = zmiennosc$sigma_2,
+  bv = bv_dzienny$BV,
+  iq = tq_dzienny$TQ,
+  n = zmiennosc$n
+)
+
+theta <- (pi^2 / 4) + pi - 5
+
+bns_dzienny <- bns_dzienny %>%
+  mutate(
+    bns = (n^(1/2) * (rv - bv)) / sqrt(theta * iq),
+    odrzucenie = bns > qnorm(0.95)
+  )
+
+punkty_skokow <- zmiennosc %>%
+  inner_join(bns_dzienny %>% select(data, odrzucenie), by = "data") %>%
+  filter(odrzucenie == TRUE)
+
+ggplot() +
+  geom_line(data = zmiennosc, 
+            aes(data, sigma_2, linetype = "zmienność zrealizowana (sigma 2)"), linewidth = 0.3) +
+  geom_line(data = bv_dzienny, 
+            aes(data, BV, linetype = "wariancja dwupotegowa (BV)"), linewidth = 0.3) +
+  geom_point(data = punkty_skokow,
+             aes(x = data, y = sigma_2, color = "Wykryte skoki"),
+             size = 1.5, shape = 16) +
+  theme_linedraw(base_size = 7) +
+  scale_x_date(date_breaks = "3 months", date_labels = "%Y-%m") +
+  labs(title = "Test oparty na różnicach - Spółka A",
+       y = "zmienność zrealizowana / wariacja dwupotęgowa") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_blank(), legend.title = element_blank(),
+        legend.position = "bottom")
+```
+tutaj jest test oparty na różnicach logarytmów (slajd 31)
+wykres do ogarnięcia
+```{r}
+bns_dzienny <- bns_dzienny %>%
+  mutate(
+    bns_logarytmow = (n^(1/2) * (log(rv) - log(bv))) / sqrt(theta * iq * bv^2),
+    odrzucenie_logarytmow = bns_logarytmow > qnorm(0.95)
+  )
+
+punkty_skokow2 <- zmiennosc %>%
+  inner_join(bns_dzienny %>% select(data, odrzucenie_logarytmow), by = "data") %>%
+  filter(odrzucenie_logarytmow == TRUE)
+
+ggplot() +
+  geom_line(data = zmiennosc, 
+            aes(data, sigma_2, linetype = "zmienność zrealizowana (sigma 2)"), linewidth = 0.3) +
+  geom_line(data = bv_dzienny, 
+            aes(data, BV, linetype = "wariancja dwupotegowa (BV)"), linewidth = 0.3) +
+  geom_point(data = punkty_skokow2,
+             aes(x = data, y = sigma_2, color = "Wykryte skoki"),
+             size = 1.5, shape = 16) +
+  theme_linedraw(base_size = 7) +
+  scale_x_date(date_breaks = "3 months", date_labels = "%Y-%m") +
+  labs(title = "Test oparty na różnicach logarytmów - Spółka A",
+       y = "zmienność zrealizowana / wariacja dwupotęgowa") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_blank(), legend.title = element_blank(),
+        legend.position = "bottom")
+```
+
+a tu test ilorazowy (slajd 35)
+wykres do ogarnięcia
+```{r}
+bns_dzienny <- bns_dzienny %>%
+  mutate(
+    bns_ilorazowy = (n^(1/2) * (log(rv) - log(bv))) / sqrt(theta * max(1,iq/bv^2)),
+    odrzucenie_ilorazowy = bns_ilorazowy > qnorm(0.95)
+  )
+
+punkty_skokow3 <- zmiennosc %>%
+  inner_join(bns_dzienny %>% select(data, bns_ilorazowy), by = "data") %>%
+  filter(bns_ilorazowy == TRUE)
+
+ggplot() +
+  geom_line(data = zmiennosc, 
+            aes(data, sigma_2, linetype = "zmienność zrealizowana (sigma 2)"), linewidth = 0.3) +
+  geom_line(data = bv_dzienny, 
+            aes(data, BV, linetype = "wariancja dwupotegowa (BV)"), linewidth = 0.3) +
+  geom_point(data = punkty_skokow3,
+             aes(x = data, y = sigma_2, color = "Wykryte skoki"),
+             size = 1.5, shape = 16) +
+  theme_linedraw(base_size = 7) +
+  scale_x_date(date_breaks = "3 months", date_labels = "%Y-%m") +
+  labs(title = "Test ilorazowy - Spółka A",
+       y = "zmienność zrealizowana / wariacja dwupotęgowa") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_blank(), legend.title = element_blank(),
+        legend.position = "bottom")
+```
